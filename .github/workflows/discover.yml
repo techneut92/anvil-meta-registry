@@ -1,0 +1,119 @@
+name: discover
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # daily at 06:00 UTC
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+# Permissions kept tight: the discovery bot only needs to read public APIs
+# and write back to this repo's own main branch.
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    name: scan github + codeberg + gitlab for `anvil-registry` topic
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: gather candidate registries from every host
+        run: |
+          set -euo pipefail
+          : > /tmp/candidates.tsv
+
+          # --- GitHub: gh CLI is already on the runner. -------------------
+          echo "scanning github.com ..."
+          gh search repos --topic=anvil-registry --limit=200 \
+            --json fullName,description,url \
+            --jq '.[] | [.fullName, "github", .url, .description] | @tsv' \
+            >> /tmp/candidates.tsv || true
+
+          # --- Codeberg (Gitea API) ---------------------------------------
+          echo "scanning codeberg.org ..."
+          curl -fsSL "https://codeberg.org/api/v1/repos/search?topic=true&q=anvil-registry&limit=50" 2>/dev/null \
+            | python3 -c "
+          import json, sys
+          for r in json.load(sys.stdin).get('data', []):
+              print('\t'.join([r['full_name'], 'codeberg', r['clone_url'], r.get('description','') or '']))
+          " >> /tmp/candidates.tsv || true
+
+          # --- GitLab (REST v4) -------------------------------------------
+          echo "scanning gitlab.com ..."
+          curl -fsSL "https://gitlab.com/api/v4/projects?topic=anvil-registry&per_page=100" 2>/dev/null \
+            | python3 -c "
+          import json, sys
+          for r in json.load(sys.stdin):
+              print('\t'.join([r['path_with_namespace'], 'gitlab', r['http_url_to_repo'], r.get('description') or '']))
+          " >> /tmp/candidates.tsv || true
+
+          sort -u /tmp/candidates.tsv -o /tmp/candidates.tsv
+          echo "candidates collected: $(wc -l < /tmp/candidates.tsv)"
+
+      - name: validate each candidate clones + has a real anvil-registry.toml
+        run: |
+          set -euo pipefail
+          : > /tmp/validated.tsv
+          while IFS=$'\t' read -r full_name host url description; do
+            [ -z "$url" ] && continue
+            dest="$(mktemp -d)"
+            if git clone --depth=1 "$url" "$dest" >/dev/null 2>&1 \
+               && [ -f "$dest/anvil-registry.toml" ] \
+               && python3 -c "import tomllib,sys; d=tomllib.load(open('$dest/anvil-registry.toml','rb')); assert d.get('schema_version')==1" >/dev/null 2>&1; then
+              echo -e "${full_name}\t${host}\t${url}\t${description}" >> /tmp/validated.tsv
+            fi
+            rm -rf "$dest"
+          done < /tmp/candidates.tsv
+          echo "validated: $(wc -l < /tmp/validated.tsv)"
+
+      - name: rewrite anvil-meta-registry.toml
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import pathlib, re
+
+          # Slugify "user/repo" → "user-repo" for the TOML key.
+          def slug(s):
+              return re.sub(r'[^a-zA-Z0-9-]', '-', s).strip('-')
+
+          rows = []
+          for line in pathlib.Path("/tmp/validated.tsv").read_text().splitlines():
+              parts = line.split('\t')
+              if len(parts) < 3:
+                  continue
+              full_name, host, url, *rest = parts
+              summary = (rest[0] if rest else '').strip()
+              rows.append((slug(full_name), host, url, summary))
+          rows.sort()
+
+          out = ["schema_version = 1", "", f"# Last refreshed by discover.yml at {datetime.now(timezone.utc).isoformat()}", ""]
+          for key, host, url, summary in rows:
+              out.append(f"[registries.{key}]")
+              out.append(f'url     = "{url}"')
+              out.append(f'host    = "{host}"')
+              if summary:
+                  # Escape quotes in the TOML string.
+                  s = summary.replace('"', "'")
+                  out.append(f'summary = "{s}"')
+              out.append("")
+          pathlib.Path("anvil-meta-registry.toml").write_text("\n".join(out))
+          print(f"wrote {len(rows)} registries")
+          PY
+
+      - name: commit + push if anything changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- anvil-meta-registry.toml; then
+            echo "no changes."
+            exit 0
+          fi
+          git config user.email "anvil-bot@users.noreply.github.com"
+          git config user.name "anvil-discover-bot"
+          git add anvil-meta-registry.toml
+          git commit -m "discover: refresh anvil-meta-registry.toml ($(date -u +%Y-%m-%d))"
+          git push

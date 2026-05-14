@@ -1,0 +1,14 @@
+schema_version = 1
+
+# The "registry of registries". Each entry is a public anvil registry
+# discovered automatically (or curated by hand) — `anvil discover` /
+# Phase 2 tooling consults this list so users can find every known
+# third-party tap from a single subscription.
+#
+# Hosts: GitHub, Codeberg, GitLab — the `host` field is informational;
+# anvil only cares about `url` (any git URL gix can clone).
+
+[registries.anvil-official]
+url     = "https://github.com/techneut92/anvil-registry"
+host    = "github"
+summary = "anvil's curated main package registry"
