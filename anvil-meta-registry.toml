@@ -1,6 +1,6 @@
 schema_version = 1
 
-# Last refreshed by discover.yml at 2026-06-01T11:43:14.294234+00:00
+# Last refreshed by discover.yml at 2026-06-02T10:43:32.032225+00:00
 
 [registries.techneut92-anvil-registry]
 url     = "https://github.com/techneut92/anvil-registry"
